@@ -35,10 +35,14 @@ pub struct AntigravityParser {
 
 impl AntigravityParser {
     fn cache_dir() -> PathBuf {
-        let home = directories::UserDirs::new()
-            .map(|dirs| dirs.home_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("~"));
-        home.join(".cache").join("niriksh")
+        if let Ok(dir) = std::env::var("NIRIKSH_CACHE_DIR") {
+            PathBuf::from(dir)
+        } else {
+            let home = directories::UserDirs::new()
+                .map(|dirs| dirs.home_dir().to_path_buf())
+                .unwrap_or_else(|| PathBuf::from("~"));
+            home.join(".cache").join("niriksh")
+        }
     }
 
     fn cache_path() -> PathBuf {
@@ -46,10 +50,7 @@ impl AntigravityParser {
     }
 
     fn statusline_path() -> PathBuf {
-        let home = directories::UserDirs::new()
-            .map(|dirs| dirs.home_dir().to_path_buf())
-            .unwrap_or_else(|| PathBuf::from("~"));
-        home.join(".cache").join("niriksh").join("antigravity-statusline.jsonl")
+        Self::cache_dir().join("antigravity-statusline.jsonl")
     }
 
     fn get_flag_value(line: &str, flags: &[&str]) -> Option<String> {
@@ -88,28 +89,110 @@ impl AntigravityParser {
         None
     }
 
+    fn test_port(port: u16, csrf_token: &str) -> bool {
+        let rt = match Runtime::new() {
+            Ok(r) => r,
+            Err(_) => return false,
+        };
+        let client = match reqwest::Client::builder()
+            .danger_accept_invalid_certs(true)
+            .timeout(std::time::Duration::from_millis(1000))
+            .build() {
+                Ok(c) => c,
+                Err(_) => return false,
+            };
+        let url = format!("https://127.0.0.1:{}/exa.language_server_pb.LanguageServerService/GetAvailableModels", port);
+        
+        let res = rt.block_on(async {
+            client.post(&url)
+                .header("Content-Type", "application/json")
+                .header("Connect-Protocol-Version", "1")
+                .header("X-Codeium-Csrf-Token", csrf_token)
+                .body("{}")
+                .send()
+                .await
+        });
+        
+        if let Ok(response) = res {
+            response.status() == reqwest::StatusCode::OK
+        } else {
+            false
+        }
+    }
+
+    fn get_process_ports_windows(pid: u32) -> Vec<u16> {
+        let script = format!("Get-NetTCPConnection -State Listen -OwningProcess {} | Select-Object -ExpandProperty LocalPort", pid);
+        if let Ok(output) = Command::new("powershell.exe")
+            .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", &script])
+            .output()
+        {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                return stdout.lines()
+                    .filter_map(|line| line.trim().parse::<u16>().ok())
+                    .collect();
+            }
+        }
+        Vec::new()
+    }
+
+    fn get_process_ports_unix(pid: u32) -> Vec<u16> {
+        if let Ok(output) = Command::new("lsof")
+            .args(&["-a", "-i", "-P", "-n", "-p", &pid.to_string()])
+            .output()
+        {
+            if let Ok(stdout) = String::from_utf8(output.stdout) {
+                let mut ports = Vec::new();
+                for line in stdout.lines() {
+                    if line.contains("LISTEN") {
+                        if let Some(idx) = line.rfind(':') {
+                            let after_colon = &line[idx + 1..];
+                            let port_str: String = after_colon.chars().take_while(|c| c.is_ascii_digit()).collect();
+                            if let Ok(port) = port_str.parse::<u16>() {
+                                ports.push(port);
+                            }
+                        }
+                    }
+                }
+                return ports;
+            }
+        }
+        Vec::new()
+    }
+
     fn detect_servers() -> Vec<ServerInfo> {
         let mut servers = Vec::new();
-        let mut lines = Vec::new();
+        let mut processes = Vec::new();
 
         if cfg!(windows) {
-            let script = "$ErrorActionPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*language_server*' -and $_.CommandLine -like '*antigravity*' } | ForEach-Object { $_.CommandLine }";
+            let script = "$ErrorActionPreference = 'SilentlyContinue'; [Console]::OutputEncoding = [System.Text.Encoding]::UTF8; Get-CimInstance Win32_Process | Where-Object { $_.CommandLine -and $_.CommandLine -like '*language_server*' -and $_.CommandLine -like '*antigravity*' } | ForEach-Object { @{ PID = $_.ProcessId; Cmd = $_.CommandLine } | ConvertTo-Json -Compress }";
             if let Ok(output) = Command::new("powershell.exe")
                 .args(&["-NoProfile", "-NonInteractive", "-ExecutionPolicy", "Bypass", "-Command", script])
                 .output()
             {
                 if let Ok(stdout) = String::from_utf8(output.stdout) {
                     for line in stdout.lines() {
-                        lines.push(line.to_string());
+                        if line.trim().is_empty() { continue; }
+                        if let Ok(v) = serde_json::from_str::<Value>(line) {
+                            if let (Some(pid), Some(cmd)) = (v.get("PID").and_then(|p| p.as_u64()), v.get("Cmd").and_then(|c| c.as_str())) {
+                                processes.push((pid as u32, cmd.to_string()));
+                            }
+                        }
                     }
                 }
             }
         } else {
-            if let Ok(output) = Command::new("ps").args(&["-ww", "-eo", "args"]).output() {
+            if let Ok(output) = Command::new("ps").args(&["-ww", "-eo", "pid=,args="]).output() {
                 if let Ok(stdout) = String::from_utf8(output.stdout) {
                     for line in stdout.lines() {
-                        if line.contains("language_server") && line.contains("antigravity") {
-                            lines.push(line.to_string());
+                        let line = line.trim();
+                        if line.is_empty() { continue; }
+                        let lower = line.to_lowercase();
+                        if lower.contains("language_server") && lower.contains("antigravity") {
+                            if let Some(space_idx) = line.find(' ') {
+                                if let Ok(pid) = line[..space_idx].parse::<u32>() {
+                                    processes.push((pid, line[space_idx + 1..].to_string()));
+                                }
+                            }
                         }
                     }
                 }
@@ -120,21 +203,47 @@ impl AntigravityParser {
         let csrf_flags = ["csrf_token", "extension_server_csrf_token", "csrf-token", "extension-server-csrf-token"];
         let app_data_dir_flags = ["app_data_dir", "app-data-dir"];
 
-        for line in lines {
-            let port_str = Self::get_flag_value(&line, &port_flags);
-            let csrf = Self::get_flag_value(&line, &csrf_flags);
-            let app_data_dir = Self::get_flag_value(&line, &app_data_dir_flags).map(|s| {
+        for (pid, cmd) in processes {
+            let port_str = Self::get_flag_value(&cmd, &port_flags);
+            let csrf = Self::get_flag_value(&cmd, &csrf_flags);
+            let app_data_dir = Self::get_flag_value(&cmd, &app_data_dir_flags).map(|s| {
                 let lower = s.replace("\\", "/").to_lowercase();
                 if lower.contains("antigravity-ide") { "antigravity-ide".to_string() }
                 else if lower.contains("antigravity-cli") { "antigravity-cli".to_string() }
                 else { "antigravity".to_string() }
             });
 
-            if let (Some(p_str), Some(csrf_token)) = (port_str, csrf) {
-                if let Ok(port) = p_str.parse::<u16>() {
-                    if port > 0 {
-                        servers.push(ServerInfo { port, csrf_token, app_data_dir });
+            if let Some(csrf_token) = csrf {
+                let mut resolved_port = 0;
+
+                if app_data_dir.as_deref() != Some("antigravity-ide") {
+                    if let Some(p_str) = port_str {
+                        if let Ok(p) = p_str.parse::<u16>() {
+                            resolved_port = p;
+                        }
                     }
+                }
+
+                if resolved_port == 0 {
+                    let ports = if cfg!(windows) {
+                        Self::get_process_ports_windows(pid)
+                    } else {
+                        Self::get_process_ports_unix(pid)
+                    };
+                    for p in ports {
+                        if Self::test_port(p, &csrf_token) {
+                            resolved_port = p;
+                            break;
+                        }
+                    }
+                }
+
+                if resolved_port > 0 {
+                    servers.push(ServerInfo {
+                        port: resolved_port,
+                        csrf_token,
+                        app_data_dir,
+                    });
                 }
             }
         }
@@ -266,7 +375,7 @@ impl Provider for AntigravityParser {
     }
 
     fn parse_session(&self, file_path: &PathBuf) -> Result<Session, Box<dyn std::error::Error>> {
-        let is_statusline = file_path == &Self::statusline_path();
+        let is_statusline = file_path.file_name().and_then(|n| n.to_str()) == Some("antigravity-statusline.jsonl");
         let mut session_cost = 0.0;
         let mut total_input = 0;
         let mut total_output = 0;
