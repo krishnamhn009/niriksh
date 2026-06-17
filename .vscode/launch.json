@@ -5,15 +5,22 @@
     "version": "0.2.0",
     "configurations": [
                 {
-            "type": "lldb",
-            "request": "launch",
-            "name": "Debug 'niriksh'",
-            "cargo": {
-                "args": ["build"]
-            },
-            "args": ["report"],
-            "cwd": "${workspaceFolder}"
-            },
+    "type": "lldb",
+    "request": "launch",
+    "name": "Debug niriksh",
+    "cargo": {
+        "args": [
+            "build",
+            "--bin=niriksh"
+        ],
+        "filter": {
+            "name": "niriksh",
+            "kind": "bin"
+        }
+    },
+    "args": ["report"],
+    "cwd": "${workspaceFolder}"
+},
         {
             "name": "Debug executable 'niriksh'",
             "type": "lldb",

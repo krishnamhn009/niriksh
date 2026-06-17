@@ -1,6 +1,7 @@
 use crate::models::{CarbonFootprint, Cost, ParsedProviderCall, Session, TokenUsage};
 use crate::pricing::PricingEngine;
 use crate::provider::Provider;
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use std::fs;
 use std::path::PathBuf;
@@ -29,9 +30,13 @@ impl Provider for GeminiParser {
                     let chats_dir = entry.path().join("chats");
                     if let Ok(chat_entries) = fs::read_dir(chats_dir) {
                         for chat_entry in chat_entries.flatten() {
-                            let file_name = chat_entry.file_name().into_string().unwrap_or_default();
-                            if file_name.starts_with("session-") && (file_name.ends_with(".json") || file_name.ends_with(".jsonl")) {
-                                sources.push(chat_entry.path());
+                            if let Ok(file_type) = chat_entry.file_type() {
+                                if file_type.is_file() {
+                                    let file_name = chat_entry.file_name().into_string().unwrap_or_default();
+                                    if file_name.starts_with("session-") && (file_name.ends_with(".json") || file_name.ends_with(".jsonl")) {
+                                        sources.push(chat_entry.path());
+                                    }
+                                }
                             }
                         }
                     }
@@ -47,10 +52,14 @@ impl Provider for GeminiParser {
         // Parse either JSON or JSONL (as seen in `gemini.ts`)
         let mut messages = Vec::new();
         let mut session_id = String::new();
+        let mut start_time = String::new();
         
         if let Ok(parsed) = serde_json::from_str::<Value>(&content) {
             if let Some(sess_id) = parsed.get("sessionId").and_then(|s| s.as_str()) {
                 session_id = sess_id.to_string();
+            }
+            if let Some(st) = parsed.get("startTime").and_then(|s| s.as_str()) {
+                start_time = st.to_string();
             }
             if let Some(msg_array) = parsed.get("messages").and_then(|m| m.as_array()) {
                 messages = msg_array.clone();
@@ -64,6 +73,9 @@ impl Provider for GeminiParser {
                     if let Some(sess_id) = obj.get("sessionId").and_then(|s| s.as_str()) {
                         if session_id.is_empty() {
                             session_id = sess_id.to_string();
+                            if let Some(st) = obj.get("startTime").and_then(|s| s.as_str()) {
+                                start_time = st.to_string();
+                            }
                         }
                     } else if obj.get("id").is_some() && obj.get("type").is_some() {
                         messages.push(obj);
@@ -82,6 +94,9 @@ impl Provider for GeminiParser {
         let mut total_cached = 0;
         let mut session_cost = 0.0;
         let mut last_user_message = String::new();
+
+        let mut seen_keys = std::collections::HashSet::new();
+        let mut gemini_ordinal = 0;
 
         for msg in messages {
             if let Some(msg_type) = msg.get("type").and_then(|t| t.as_str()) {
@@ -110,7 +125,10 @@ impl Provider for GeminiParser {
                     None => continue,
                 };
                 
-                let model = msg.get("model").and_then(|m| m.as_str()).unwrap_or("gemini-2.0-flash");
+                let model = match msg.get("model").and_then(|m| m.as_str()) {
+                    Some(m) if !m.is_empty() => m,
+                    _ => continue,
+                };
                 
                 let input = tokens.get("input").and_then(|v| v.as_u64()).unwrap_or(0);
                 let output = tokens.get("output").and_then(|v| v.as_u64()).unwrap_or(0);
@@ -118,6 +136,43 @@ impl Provider for GeminiParser {
                 let thoughts = tokens.get("thoughts").and_then(|v| v.as_u64()).unwrap_or(0);
                 
                 if input == 0 && output == 0 && cached == 0 && thoughts == 0 { continue; }
+
+                // Deduplication check using the same format as gemini.ts
+                let msg_id = msg.get("id").and_then(|i| i.as_str()).map(|s| s.to_string())
+                    .unwrap_or_else(|| {
+                        let key = format!("idx-{}", gemini_ordinal);
+                        gemini_ordinal += 1;
+                        key
+                    });
+                
+                let dedup_key = format!("gemini:{}:{}", session_id, msg_id);
+                if seen_keys.contains(&dedup_key) {
+                    continue;
+                }
+                seen_keys.insert(dedup_key.clone());
+
+                // Timestamp validation and fallback to start_time
+                let ts_str = msg.get("timestamp")
+                    .and_then(|t| t.as_str())
+                    .filter(|t| !t.is_empty())
+                    .unwrap_or(&start_time);
+
+                let parsed_dt = if !ts_str.is_empty() {
+                    if let Ok(dt) = ts_str.parse::<DateTime<Utc>>() {
+                        Some(dt)
+                    } else if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(ts_str) {
+                        Some(dt.with_timezone(&Utc))
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
+
+                let dt = match parsed_dt {
+                    Some(dt) if dt.timestamp_millis() >= 1_000_000_000_000 => dt,
+                    _ => continue,
+                };
 
                 // Gemini's `input` includes `cached`
                 let fresh_input = input.saturating_sub(cached);
@@ -130,7 +185,7 @@ impl Provider for GeminiParser {
                 session_cost += cost;
 
                 parsed_calls.push(ParsedProviderCall {
-                    timestamp: msg.get("timestamp").and_then(|t| t.as_str()).unwrap_or("").to_string(),
+                    timestamp: dt.to_rfc3339_opts(chrono::SecondsFormat::Millis, true),
                     model: model.to_string(),
                     token_usage: TokenUsage {
                         input: fresh_input,

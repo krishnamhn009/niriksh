@@ -4,8 +4,12 @@ mod models;
 mod parsers;
 mod pricing;
 mod provider;
-
 mod tui;
+
+mod models_report;
+mod optimize;
+mod compare;
+mod yield_report;
 
 use clap::Parser;
 use cli::{Cli, Commands};
@@ -232,5 +236,104 @@ fn main() {
                 eprintln!("Error running TUI: {}", e);
             }
         }
+        Commands::Models { period, provider } => {
+            println!("Generating Models report...");
+            let sessions = load_all_sessions(period, provider.as_deref());
+            models_report::run_models_report(&sessions);
+        }
+        Commands::Optimize { period, provider } => {
+            println!("Running Optimization check...");
+            let sessions = load_all_sessions(period, provider.as_deref());
+            optimize::run_optimize(&sessions);
+        }
+        Commands::Compare { period, provider } => {
+            println!("Comparing models...");
+            let sessions = load_all_sessions(period, provider.as_deref());
+            compare::run_compare(&sessions);
+        }
+        Commands::Yield { period } => {
+            println!("Analyzing yield...");
+            let sessions = load_all_sessions(period, None);
+            let cwd = std::env::current_dir()
+                .map(|p| p.to_string_lossy().to_string())
+                .unwrap_or_else(|_| ".".to_string());
+            yield_report::run_yield_report(&sessions, &cwd);
+        }
     }
+}
+
+fn load_all_sessions(period: &str, provider_filter: Option<&str>) -> Vec<crate::models::Session> {
+    use crate::filters::Filters;
+    let filters = Filters::new(period.to_string(), provider_filter.map(|s| s.to_string()));
+    let mut all_sessions = Vec::new();
+
+    let mut add_session = |provider_name: &str, mut session: crate::models::Session| {
+        let mut has_allowed_call = false;
+        session.calls.retain(|call| {
+            let allowed = filters.is_allowed(provider_name, call);
+            if allowed {
+                has_allowed_call = true;
+            }
+            allowed
+        });
+        if has_allowed_call {
+            let mut cost = 0.0;
+            let mut input = 0;
+            let mut output = 0;
+            let mut cache_read = 0;
+            for call in &session.calls {
+                cost += call.cost.amount_usd;
+                input += call.token_usage.input;
+                output += call.token_usage.output;
+                cache_read += call.token_usage.cache_read;
+            }
+            session.total_cost.amount_usd = cost;
+            session.total_token_usage.input = input;
+            session.total_token_usage.output = output;
+            session.total_token_usage.cache_read = cache_read;
+            all_sessions.push(session);
+        }
+    };
+
+    // 1. Gemini
+    let gemini_parser = GeminiParser { pricing_engine: PricingEngine::new() };
+    for s in gemini_parser.discover_sessions() {
+        if let Ok(sess) = gemini_parser.parse_session(&s) {
+            add_session("Gemini", sess);
+        }
+    }
+
+    // 2. Claude
+    let claude_parser = ClaudeParser { pricing_engine: PricingEngine::new() };
+    for s in claude_parser.discover_sessions() {
+        if let Ok(sess) = claude_parser.parse_session(&s) {
+            add_session("Claude", sess);
+        }
+    }
+
+    // 3. Cursor
+    let cursor_parser = CursorParser { pricing_engine: PricingEngine::new() };
+    for s in cursor_parser.discover_sessions() {
+        if let Ok(sess) = cursor_parser.parse_session(&s) {
+            add_session("Cursor", sess);
+        }
+    }
+
+    // 4. Copilot
+    let copilot_parser = CopilotParser { pricing_engine: PricingEngine::new() };
+    for s in copilot_parser.discover_sessions() {
+        if let Ok(sess) = copilot_parser.parse_session(&s) {
+            add_session("Copilot", sess);
+        }
+    }
+
+    // 5. Antigravity
+    let antigravity_parser = AntigravityParser { pricing_engine: PricingEngine::new() };
+    for s in antigravity_parser.discover_sessions() {
+        if let Ok(sess) = antigravity_parser.parse_session(&s) {
+            add_session("Antigravity", sess);
+        }
+    }
+
+    all_sessions
 }
